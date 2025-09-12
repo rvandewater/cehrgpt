@@ -15,6 +15,7 @@ from cehrbert.runners.runner_util import (
     load_parquet_as_dataset,
 )
 from datasets import DatasetDict, concatenate_datasets, load_from_disk
+from meds import held_out_split, subject_id_field, train_split, tuning_split
 from transformers import TrainingArguments
 from transformers.utils import logging
 
@@ -126,7 +127,9 @@ def prepare_finetune_dataset(
                 )
     else:
         train_set, validation_set, test_set = create_dataset_splits(
-            data_args=data_args, seed=training_args.seed
+            data_args=data_args,
+            cehrgpt_args=cehrgpt_args,
+            seed=training_args.seed,
         )
     # Organize them into a single DatasetDict
     final_splits = DatasetDict(
@@ -135,7 +138,11 @@ def prepare_finetune_dataset(
     return final_splits
 
 
-def create_dataset_splits(data_args: DataTrainingArguments, seed: int):
+def create_dataset_splits(
+    data_args: DataTrainingArguments,
+    cehrgpt_args: CehrGPTArguments,
+    seed: int,
+):
     """
     Creates training, validation, and testing dataset splits based on specified splitting strategies.
 
@@ -159,6 +166,7 @@ def create_dataset_splits(data_args: DataTrainingArguments, seed: int):
             - `test_eval_ratio` (float): Ratio of test to validation data when creating a test set from validation.
             - `preprocessing_num_workers` (int): Number of processes for parallel data filtering.
             - `preprocessing_batch_size` (int): Batch size for batched operations.
+        cehrgpt_args (CehrGPTArguments): A configuration object containing CehrGPTArguments.
         seed (int): Random seed for reproducibility of splits.
 
     Returns:
@@ -187,84 +195,110 @@ def create_dataset_splits(data_args: DataTrainingArguments, seed: int):
         else load_parquet_as_dataset(data_args.test_data_folder)
     )
 
-    if data_args.chronological_split:
-        # Chronological split by sorting on `index_date`
-        dataset = dataset.sort("index_date")
-        total_size = len(dataset)
-        train_end = int((1 - data_args.validation_split_percentage) * total_size)
+    # Patient-based split
+    LOG.info("Using the split_by_patient strategy")
+    unique_patient_ids = dataset.unique("person_id")
+    np.random.seed(seed)
+    np.random.shuffle(unique_patient_ids)
+    train_end = int(
+        len(unique_patient_ids) * (1 - data_args.validation_split_percentage)
+    )
+    LOG.info(f"There are {len(unique_patient_ids)} patients in total")
 
-        # Perform the split
-        train_set = dataset.select(range(0, train_end))
-        validation_set = dataset.select(range(train_end, total_size))
+    train_patient_ids, val_patient_ids, test_patient_ids = None, None, None
 
-        if test_set is None:
-            test_valid_split = validation_set.train_test_split(
-                test_size=data_args.test_eval_ratio, seed=seed
+    if cehrgpt_args.patient_splits_path:
+        # If the patient_splits path is a folder (cehrgpt patient splits), then we assume that it contains a list of parquet files.
+        if os.path.isdir(cehrgpt_args.patient_splits_path):
+            patient_splits = pl.read_parquet(
+                os.path.join(cehrgpt_args.patient_splits_path, "*.parquet")
             )
-            validation_set, test_set = (
-                test_valid_split["train"],
-                test_valid_split["test"],
-            )
-
-    elif data_args.split_by_patient:
-        # Patient-based split
-        LOG.info("Using the split_by_patient strategy")
-        unique_patient_ids = dataset.unique("person_id")
-        LOG.info(f"There are {len(unique_patient_ids)} patients in total")
-
-        np.random.seed(seed)
-        np.random.shuffle(unique_patient_ids)
-
-        train_end = int(
-            len(unique_patient_ids) * (1 - data_args.validation_split_percentage)
-        )
-        train_patient_ids = set(unique_patient_ids[:train_end])
-
-        if test_set is None:
-            validation_end = int(
-                train_end
-                + len(unique_patient_ids)
-                * data_args.validation_split_percentage
-                * data_args.test_eval_ratio
-            )
-            val_patient_ids = set(unique_patient_ids[train_end:validation_end])
-            test_patient_ids = set(unique_patient_ids[validation_end:])
         else:
-            val_patient_ids, test_patient_ids = (
-                set(unique_patient_ids[train_end:]),
-                None,
+            # If the patient_splits path is a file, it must be a parquet file
+            file_parts = os.path.splitext(cehrgpt_args.patient_splits_path)
+            if not file_parts or not file_parts[-1].endswith("parquet"):
+                raise ValueError(
+                    f"{cehrgpt_args.patient_splits_path} is not a valid patient splits path."
+                )
+            patient_splits = pl.read_parquet(cehrgpt_args.patient_splits_path)
+
+        if len(patient_splits) == 0:
+            raise RuntimeError(
+                f"The patient_splits at {cehrgpt_args.patient_splits_path} contains empty rows"
             )
-
-        # Helper function to apply patient-based filtering
-        def filter_by_patient_ids(patient_ids):
-            return dataset.filter(
-                lambda batch: [pid in patient_ids for pid in batch["person_id"]],
-                num_proc=data_args.preprocessing_num_workers,
-                batched=True,
-                batch_size=data_args.preprocessing_batch_size,
-            )
-
-        # Generate splits
-        train_set = filter_by_patient_ids(train_patient_ids).shuffle(seed=seed)
-        validation_set = filter_by_patient_ids(val_patient_ids)
-        if test_set is None:
-            test_set = filter_by_patient_ids(test_patient_ids)
-
-    else:
-        # Random split
-        train_val = dataset.train_test_split(
-            test_size=data_args.validation_split_percentage, seed=seed
+        split_values = patient_splits.select("split").unique()["split"].to_list()
+        is_split_meds_schema = np.all(
+            [
+                split in split_values
+                for split in [train_split, tuning_split, held_out_split]
+            ]
         )
-        train_set, validation_set = train_val["train"], train_val["test"]
+        # Auto-detect whether or not the patient splits follow the MEDS schema or not.
+        is_data_in_meds = (
+            subject_id_field in patient_splits.columns
+        ) and is_split_meds_schema
+        patient_splits = patient_splits.filter(
+            pl.col(subject_id_field if is_data_in_meds else "person_id").is_in(
+                unique_patient_ids
+            )
+        )
+        LOG.info(
+            f"Patient Splits Schema: %s",
+            "MEDS patient splits" if is_data_in_meds else "Traditional patient splits",
+        )
+        LOG.info("Effective patient_splits size: %s", len(patient_splits))
+        if is_data_in_meds:
+            train_patient_ids = patient_splits.filter(pl.col("split") == train_split)[
+                subject_id_field
+            ].to_list()
+            val_patient_ids = patient_splits.filter(pl.col("split") == tuning_split)[
+                subject_id_field
+            ].to_list()
+            test_patient_ids = patient_splits.filter(pl.col("split") == held_out_split)[
+                subject_id_field
+            ].to_list()
+        else:
+            train_patient_ids = patient_splits.filter(pl.col("split") == "train")[
+                "person_id"
+            ].to_list()
+            val_patient_ids = patient_splits.filter(pl.col("split") == "validation")[
+                "person_id"
+            ].to_list()
+            test_patient_ids = patient_splits.filter(pl.col("split") == "test")[
+                "person_id"
+            ].to_list()
 
-        if test_set is None:
-            test_valid_split = validation_set.train_test_split(
-                test_size=data_args.test_eval_ratio, seed=seed
-            )
-            validation_set, test_set = (
-                test_valid_split["train"],
-                test_valid_split["test"],
-            )
+    # In case that we could not retrieve the corresponding patient_ids
+    if not train_patient_ids:
+        train_patient_ids = unique_patient_ids[:train_end]
+
+    if not val_patient_ids:
+        val_patient_ids = unique_patient_ids[train_end:]
+
+    if not test_set and not test_patient_ids:
+        validation_end = int(len(val_patient_ids) * data_args.test_eval_ratio)
+        val_patient_ids = val_patient_ids[:validation_end]
+        test_patient_ids = val_patient_ids[validation_end:]
+
+    # Helper function to apply patient-based filtering
+    def filter_by_patient_ids(patient_ids):
+        unique_ids = set(patient_ids)
+        return dataset.filter(
+            lambda batch: [pid in unique_ids for pid in batch["person_id"]],
+            num_proc=data_args.preprocessing_num_workers,
+            batched=True,
+            batch_size=data_args.preprocessing_batch_size,
+        )
+
+    # Generate splits
+    train_set = filter_by_patient_ids(train_patient_ids).shuffle(seed=seed)
+    validation_set = filter_by_patient_ids(val_patient_ids)
+    if not test_set:
+        test_set = filter_by_patient_ids(test_patient_ids)
+
+    LOG.info("Train size: %s", len(train_set))
+    LOG.info("Validation size: %s", len(validation_set))
+    LOG.info("Test size: %s", len(test_set))
 
     return train_set, validation_set, test_set
 
