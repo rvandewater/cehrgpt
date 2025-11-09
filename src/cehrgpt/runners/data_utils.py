@@ -390,6 +390,7 @@ def extract_cohort_sequences(
         batched=True,
         batch_size=data_args.preprocessing_batch_size,
         num_proc=data_args.preprocessing_num_workers,
+        writer_batch_size=100
     )
     person_index_date_agg = cohort.group_by("person_id").agg(
         pl.struct("index_date", "label").alias("index_date_label")
