@@ -421,8 +421,9 @@ def extract_cohort_sequences(
             person_index_date_map, data_args.observation_window
         ).batch_transform,
         batched=True,
-        batch_size=data_args.preprocessing_batch_size,
-        num_proc=data_args.preprocessing_num_workers,
+        batch_size=min(data_args.preprocessing_batch_size, 100),  # Cap at 100,
+        num_proc=16,
+        writer_batch_size=10,  # Significantly reduced
         remove_columns=filtered_tokenized_dataset["train"].column_names,
     )
     return processed_dataset
