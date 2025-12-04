@@ -212,7 +212,7 @@ def main():
                 f"{int(subject)}-{int(time)}" not in subject_prediction_tuples
                 for subject, time in zip(_batch["person_id"], _batch["index_date"])
             ],
-            num_proc=data_args.preprocessing_num_workers,
+            num_proc=16,
             batch_size=data_args.preprocessing_batch_size,
             batched=True,
         )
